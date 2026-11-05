@@ -464,6 +464,34 @@ async def admin_set_payout_amount(message: Message, state: FSMContext):
         )
 
     await state.clear()
+
+    # Publish the confirmed payout details in the configured "ВЫПЛАТЫ" topic.
+    if PAYOUT_GROUP_ID:
+        try:
+            with connect() as con:
+                details = con.execute(
+                    "SELECT username, wallet, amount FROM requests WHERE id=?",
+                    (request_id,)
+                ).fetchone()
+            topic_post = (
+                f"✅ <b>ВЫПЛАТА ОДОБРЕНА №{request_id}</b>\n"
+                f"👤 Воркер: {display_user(row['user_id'], details['username'] if details else '')}\n"
+                f"💰 Запрошено: <b>{details['amount'] if details and details['amount'] else 'не указано'} TON</b>\n"
+                f"💸 К выплате: <b>{amount_text} TON</b>\n"
+                f"👛 Кошелёк: <code>{details['wallet'] if details else 'не указан'}</code>\n"
+                f"🕒 Время: {stamp()}"
+            )
+            await bot.send_message(
+                chat_id=PAYOUT_GROUP_ID,
+                text=topic_post,
+                message_thread_id=PAYOUT_TOPIC_ID or None
+            )
+        except Exception:
+            logging.exception(
+                "Failed to publish approved payout in topic (group_id=%s, topic_id=%s)",
+                PAYOUT_GROUP_ID, PAYOUT_TOPIC_ID
+            )
+
     try:
         await bot.send_message(
             row["user_id"],
