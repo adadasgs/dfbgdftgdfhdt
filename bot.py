@@ -11,6 +11,8 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiohttp import web
+
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
@@ -525,10 +527,30 @@ async def admin_payout_amount_wrong(message: Message):
         await message.answer("Введите сумму выплаты числом, например 4.45.")
 
 
+async def health(request: web.Request):
+    return web.json_response({"status": "ok", "service": "GRET TEAM"})
+
+
 async def main():
     init_db()
+
+    # Render Web Services require an HTTP listener. Uptime monitors can
+    # check /health while Telegram polling continues in the same process.
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+
+    logging.info("GRET TEAM health server started on port %s", port)
     logging.info("GRET TEAM bot started")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
