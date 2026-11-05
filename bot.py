@@ -52,7 +52,9 @@ def init_db():
     with connect() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT NOT NULL DEFAULT '',
-            wallet TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+            wallet TEXT NOT NULL DEFAULT '', balance TEXT NOT NULL DEFAULT '0',
+            total_withdrawn TEXT NOT NULL DEFAULT '0', withdraw_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
         )""")
         con.execute("""CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
@@ -61,6 +63,13 @@ def init_db():
             photos TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL
         )""")
+        user_columns = {row["name"] for row in con.execute("PRAGMA table_info(users)")}
+        if "balance" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN balance TEXT NOT NULL DEFAULT '0'")
+        if "total_withdrawn" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN total_withdrawn TEXT NOT NULL DEFAULT '0'")
+        if "withdraw_count" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN withdraw_count INTEGER NOT NULL DEFAULT 0")
         columns = {row["name"] for row in con.execute("PRAGMA table_info(requests)")}
         if "payout_amount" not in columns:
             con.execute("ALTER TABLE requests ADD COLUMN payout_amount TEXT NOT NULL DEFAULT ''")
@@ -83,7 +92,7 @@ def save_user(user):
 def menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="💸 Выплаты")],
+            [KeyboardButton(text="💸 Выплаты"), KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="🛟 Поддержка"), KeyboardButton(text="ℹ️ О нас")],
             [KeyboardButton(text="👛 Кошелёк"), KeyboardButton(text="📤 Вывод")]
         ],
@@ -230,6 +239,27 @@ async def payout_other(message: Message):
     await message.answer("Отправьте фотографию или нажмите «📨 Отправить на выплату».")
 
 
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: Message, state: FSMContext):
+    save_user(message.from_user)
+    await state.clear()
+    with connect() as con:
+        row = con.execute(
+            "SELECT balance,total_withdrawn,withdraw_count FROM users WHERE user_id=?",
+            (message.from_user.id,)
+        ).fetchone()
+    balance = Decimal(row["balance"] or "0")
+    total = Decimal(row["total_withdrawn"] or "0")
+    await message.answer(
+        "👤 <b>Ваш профиль GRET TEAM</b>\\n\\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\\n"
+        f"💰 Баланс: <b>{format(balance.normalize(), 'f')} TON</b>\\n"
+        f"📤 Всего выведено: <b>{format(total.normalize(), 'f')} TON</b>\\n"
+        f"✅ Успешных выводов: <b>{row['withdraw_count']}</b>",
+        reply_markup=menu()
+    )
+
+
 @dp.message(F.text == "👛 Кошелёк")
 async def wallet_begin(message: Message, state: FSMContext):
     save_user(message.from_user)
@@ -293,12 +323,26 @@ async def withdraw_submit(message: Message, state: FSMContext):
     user = message.from_user
     created = stamp()
     with connect() as con:
-        row = con.execute("SELECT wallet FROM users WHERE user_id=?", (user.id,)).fetchone()
+        row = con.execute("SELECT wallet,balance FROM users WHERE user_id=?", (user.id,)).fetchone()
         if not row or not row["wallet"]:
             await state.clear()
             await message.answer("Кошелёк не найден. Сначала привяжите его.", reply_markup=menu())
             return
         wallet = row["wallet"]
+        balance = Decimal(row["balance"] or "0")
+        pending = con.execute(
+            "SELECT amount FROM requests WHERE user_id=? AND kind='withdraw' AND status='pending'",
+            (user.id,)
+        ).fetchall()
+        reserved = sum((Decimal(item["amount"] or "0") for item in pending), Decimal("0"))
+        if amount > balance - reserved:
+            available = max(balance - reserved, Decimal("0"))
+            await message.answer(
+                f"Недостаточно средств. Доступно: <b>{format(available.normalize(), 'f')} TON</b>.",
+                reply_markup=menu()
+            )
+            await state.clear()
+            return
         cur = con.execute(
             """INSERT INTO requests(user_id,username,kind,amount,wallet,status,created_at)
             VALUES(?,?, 'withdraw', ?, ?, 'pending', ?)""",
@@ -364,7 +408,7 @@ async def decide(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Заявка уже обработана.", show_alert=True)
             return
 
-        if action == "approve":
+        if action == "approve" and row["kind"] == "payout":
             await state.set_state(Form.admin_payout_amount)
             await state.update_data(admin_request_id=request_id)
             try:
@@ -372,22 +416,46 @@ async def decide(callback: CallbackQuery, state: FSMContext):
             except Exception:
                 pass
             await bot.send_message(
-                chat_id=callback.from_user.id,
-                text=(
-                    f"Заявка №{request_id} выбрана для одобрения.\n"
-                    "Напишите, сколько TON фактически одобрить. "
-                    "Можно ввести любую положительную сумму, например <code>4.45</code>."
-                )
+                callback.from_user.id,
+                f"Заявка на начисление №{request_id}. Введите сумму TON для зачисления на баланс, например <code>4.45</code>."
             )
-            await callback.answer("Отправил запрос суммы в личный чат.")
+            await callback.answer("Запросил сумму начисления в личном чате.")
             return
 
-        status = "approved" if action == "approve" else "rejected"
-        con.execute("UPDATE requests SET status=? WHERE id=?", (status, request_id))
+        if action == "approve" and row["kind"] == "withdraw":
+            amount = Decimal(row["amount"] or "0")
+            user_row = con.execute(
+                "SELECT balance,total_withdrawn FROM users WHERE user_id=?", (row["user_id"],)
+            ).fetchone()
+            if not user_row or Decimal(user_row["balance"] or "0") < amount:
+                await callback.answer("Недостаточно средств на балансе пользователя.", show_alert=True)
+                return
+            new_balance = Decimal(user_row["balance"] or "0") - amount
+            new_total = Decimal(user_row["total_withdrawn"] or "0") + amount
+            con.execute(
+                """UPDATE users SET balance=?,total_withdrawn=?,withdraw_count=withdraw_count+1,
+                updated_at=? WHERE user_id=?""",
+                (format(new_balance.normalize(), "f"), format(new_total.normalize(), "f"), stamp(), row["user_id"])
+            )
+            con.execute(
+                "UPDATE requests SET status='approved',payout_amount=? WHERE id=?",
+                (format(amount.normalize(), "f"), request_id)
+            )
+            approved_amount = format(amount.normalize(), "f")
+            status = "approved"
+        elif action == "reject":
+            status = "rejected"
+            con.execute("UPDATE requests SET status=? WHERE id=?", (status, request_id))
+        else:
+            await callback.answer("Неизвестное действие.", show_alert=True)
+            return
 
     outcome = "одобрена ✅" if status == "approved" else "отклонена ❌"
     try:
-        await bot.send_message(row["user_id"], f"Ваша заявка №{request_id} {outcome}.")
+        if status == "approved" and row["kind"] == "withdraw":
+            await bot.send_message(row["user_id"], f"Вывод №{request_id} одобрен. Списано с баланса: <b>{approved_amount} TON</b>.")
+        else:
+            await bot.send_message(row["user_id"], f"Ваша заявка №{request_id} {outcome}.")
     except Exception:
         logging.info("User notification could not be delivered: %s", row["user_id"])
 
@@ -415,13 +483,21 @@ async def admin_set_payout_amount(message: Message, state: FSMContext):
     request_id = int(data.get("admin_request_id", 0))
     with connect() as con:
         row = con.execute(
-            "SELECT user_id,status FROM requests WHERE id=?",
+            "SELECT user_id,status,kind FROM requests WHERE id=?",
             (request_id,)
         ).fetchone()
-        if not row or row["status"] != "pending":
+        if not row or row["status"] != "pending" or row["kind"] != "payout":
             await state.clear()
             await message.answer("Заявка не найдена или уже обработана.")
             return
+        user_row = con.execute("SELECT username,balance FROM users WHERE user_id=?", (row["user_id"],)).fetchone()
+        old_balance = Decimal(user_row["balance"] or "0") if user_row else Decimal("0")
+        new_balance = old_balance + amount
+        con.execute(
+            """INSERT INTO users(user_id,username,balance,updated_at) VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,updated_at=excluded.updated_at""",
+            (row["user_id"], user_row["username"] if user_row else "", format(new_balance.normalize(), "f"), stamp())
+        )
         con.execute(
             "UPDATE requests SET status='approved', payout_amount=? WHERE id=?",
             (amount_text, request_id)
@@ -432,14 +508,14 @@ async def admin_set_payout_amount(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             row["user_id"],
-            f"Ваша заявка на вывод №{request_id} одобрена.\n"
-            f"💰 <b>Сумма выплаты:</b> {amount_text} TON"
+            f"Ваша заявка на выплату №{request_id} одобрена.\n"
+            f"💰 <b>Начислено на баланс:</b> {amount_text} TON"
         )
     except Exception:
         logging.exception("Could not notify user about approved withdrawal %s", request_id)
     await message.answer(
         f"Заявка №{request_id} одобрена.\n"
-        f"💰 Сумма выплаты: <b>{amount_text} TON</b>"
+        f"💰 Начислено на баланс пользователя: <b>{amount_text} TON</b>"
     )
 
 
