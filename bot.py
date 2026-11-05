@@ -34,7 +34,16 @@ dp = Dispatcher()
 
 
 def connect():
-    con = sqlite3.connect(DB_PATH)
+    global DB_PATH
+    try:
+        db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(db_dir, exist_ok=True)
+        con = sqlite3.connect(DB_PATH)
+    except (OSError, sqlite3.OperationalError) as exc:
+        fallback = "/tmp/gret_team.sqlite3"
+        logging.warning("Cannot open DB_PATH=%r (%s). Using temporary database %s", DB_PATH, exc, fallback)
+        DB_PATH = fallback
+        con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
