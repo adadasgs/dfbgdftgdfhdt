@@ -185,39 +185,6 @@ async def payout_submit(message: Message, state: FSMContext):
         f"Фото: {len(photos)}\nВремя: {created}"
     )
     admin_sent = False
-    group_sent = False
-
-    # Publish the payout application in the configured forum topic.
-    if PAYOUT_GROUP_ID:
-        try:
-            if len(photos) == 1:
-                await bot.send_photo(
-                    chat_id=PAYOUT_GROUP_ID,
-                    photo=photos[0],
-                    caption=caption,
-                    message_thread_id=PAYOUT_TOPIC_ID or None
-                )
-            else:
-                await bot.send_media_group(
-                    chat_id=PAYOUT_GROUP_ID,
-                    media=[
-                        InputMediaPhoto(media=photos[0]),
-                        InputMediaPhoto(media=photos[1])
-                    ],
-                    message_thread_id=PAYOUT_TOPIC_ID or None
-                )
-                await bot.send_message(
-                    chat_id=PAYOUT_GROUP_ID,
-                    text=caption,
-                    message_thread_id=PAYOUT_TOPIC_ID or None
-                )
-            group_sent = True
-        except Exception:
-            logging.exception(
-                "Failed to publish payout application in group topic "
-                "(group_id=%s, topic_id=%s)",
-                PAYOUT_GROUP_ID, PAYOUT_TOPIC_ID
-            )
 
     # Keep the admin's private notification and decision buttons.
     try:
@@ -245,15 +212,14 @@ async def payout_submit(message: Message, state: FSMContext):
     except Exception:
         logging.exception("Failed to deliver payout application to admin")
 
-    if group_sent or admin_sent:
-        await message.answer("✅ Заявка отправлена." + (
-            " Она опубликована в теме выплат." if group_sent else
-            " Администратор получил её в личные сообщения."
-        ), reply_markup=menu())
+    if admin_sent:
+        await message.answer(
+            "✅ Заявка отправлена администратору.",
+            reply_markup=menu()
+        )
     else:
         await message.answer(
-            "Заявка сохранена, но не удалось отправить её в группу или администратору. "
-            "Проверьте права бота и настройки темы.",
+            "Заявка сохранена, но не удалось отправить её администратору. Попробуйте позже.",
             reply_markup=menu()
         )
     await state.clear()
@@ -349,12 +315,6 @@ async def withdraw_submit(message: Message, state: FSMContext):
         f"Статус: ⏳ Ожидает обработки"
     )
     try:
-        if PAYOUT_GROUP_ID:
-            await bot.send_message(
-                chat_id=PAYOUT_GROUP_ID,
-                text=post,
-                message_thread_id=PAYOUT_TOPIC_ID or None
-            )
         await bot.send_message(ADMIN_ID, post, reply_markup=decision_buttons(request_id))
         await message.answer("✅ Заявка на вывод отправлена.", reply_markup=menu())
     except Exception:
@@ -411,11 +371,15 @@ async def decide(callback: CallbackQuery, state: FSMContext):
                 await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:
                 pass
-            await callback.message.answer(
-                f"Заявка на вывод №{request_id} выбрана.\n"
-                "Введите фактическую сумму выплаты в TON, например <code>4.45</code>."
+            await bot.send_message(
+                chat_id=callback.from_user.id,
+                text=(
+                    f"Заявка №{request_id} выбрана для одобрения.\n"
+                    "Напишите, сколько TON фактически одобрить. "
+                    "Можно ввести любую положительную сумму, например <code>4.45</code>."
+                )
             )
-            await callback.answer("Укажите сумму выплаты.")
+            await callback.answer("Отправил запрос суммы в личный чат.")
             return
 
         status = "approved" if action == "approve" else "rejected"
