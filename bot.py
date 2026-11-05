@@ -61,6 +61,9 @@ def init_db():
             photos TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL
         )""")
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(requests)")}
+        if "payout_amount" not in columns:
+            con.execute("ALTER TABLE requests ADD COLUMN payout_amount TEXT NOT NULL DEFAULT ''")
 
 
 def stamp():
@@ -111,6 +114,7 @@ class Form(StatesGroup):
     payout_photos = State()
     wallet = State()
     withdraw_amount = State()
+    admin_payout_amount = State()
 
 
 @dp.message(CommandStart())
@@ -381,14 +385,13 @@ async def about(message: Message):
 
 
 @dp.callback_query(F.data.startswith("decision:"))
-async def decide(callback: CallbackQuery):
+async def decide(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Эта кнопка доступна только администратору.", show_alert=True)
         return
 
     _, action, raw_id = callback.data.split(":")
     request_id = int(raw_id)
-    status = "approved" if action == "approve" else "rejected"
 
     with connect() as con:
         row = con.execute(
@@ -400,6 +403,22 @@ async def decide(callback: CallbackQuery):
         if row["status"] != "pending":
             await callback.answer("Заявка уже обработана.", show_alert=True)
             return
+
+        if action == "approve" and row["kind"] == "withdraw":
+            await state.set_state(Form.admin_payout_amount)
+            await state.update_data(admin_request_id=request_id)
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await callback.message.answer(
+                f"Заявка на вывод №{request_id} выбрана.\n"
+                "Введите фактическую сумму выплаты в TON, например <code>4.45</code>."
+            )
+            await callback.answer("Укажите сумму выплаты.")
+            return
+
+        status = "approved" if action == "approve" else "rejected"
         con.execute("UPDATE requests SET status=? WHERE id=?", (status, request_id))
 
     outcome = "одобрена ✅" if status == "approved" else "отклонена ❌"
@@ -413,6 +432,56 @@ async def decide(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer("Решение сохранено.")
+
+
+@dp.message(Form.admin_payout_amount, F.text)
+async def admin_set_payout_amount(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        amount = Decimal(message.text.strip().replace(",", "."))
+        if not amount.is_finite() or amount <= 0 or amount > Decimal("1000000000"):
+            raise InvalidOperation
+        amount_text = format(amount.normalize(), "f")
+    except (InvalidOperation, ValueError):
+        await message.answer("Введите положительную сумму числом, например 4.45.")
+        return
+
+    data = await state.get_data()
+    request_id = int(data.get("admin_request_id", 0))
+    with connect() as con:
+        row = con.execute(
+            "SELECT user_id,status FROM requests WHERE id=? AND kind='withdraw'",
+            (request_id,)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            await state.clear()
+            await message.answer("Заявка не найдена или уже обработана.")
+            return
+        con.execute(
+            "UPDATE requests SET status='approved', payout_amount=? WHERE id=?",
+            (amount_text, request_id)
+        )
+
+    await state.clear()
+    try:
+        await bot.send_message(
+            row["user_id"],
+            f"Ваша заявка на вывод №{request_id} одобрена.\n"
+            f"💰 <b>Сумма выплаты:</b> {amount_text} TON"
+        )
+    except Exception:
+        logging.exception("Could not notify user about approved withdrawal %s", request_id)
+    await message.answer(
+        f"Заявка №{request_id} одобрена.\n"
+        f"💰 Сумма выплаты: <b>{amount_text} TON</b>"
+    )
+
+
+@dp.message(Form.admin_payout_amount)
+async def admin_payout_amount_wrong(message: Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Введите сумму выплаты числом, например 4.45.")
 
 
 async def main():
