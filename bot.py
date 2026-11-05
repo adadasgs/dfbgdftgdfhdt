@@ -180,20 +180,78 @@ async def payout_submit(message: Message, state: FSMContext):
         f"Telegram ID: <code>{user.id}</code>\n"
         f"Фото: {len(photos)}\nВремя: {created}"
     )
+    admin_sent = False
+    group_sent = False
+
+    # Publish the payout application in the configured forum topic.
+    if PAYOUT_GROUP_ID:
+        try:
+            if len(photos) == 1:
+                await bot.send_photo(
+                    chat_id=PAYOUT_GROUP_ID,
+                    photo=photos[0],
+                    caption=caption,
+                    message_thread_id=PAYOUT_TOPIC_ID or None
+                )
+            else:
+                await bot.send_media_group(
+                    chat_id=PAYOUT_GROUP_ID,
+                    media=[
+                        InputMediaPhoto(media=photos[0]),
+                        InputMediaPhoto(media=photos[1])
+                    ],
+                    message_thread_id=PAYOUT_TOPIC_ID or None
+                )
+                await bot.send_message(
+                    chat_id=PAYOUT_GROUP_ID,
+                    text=caption,
+                    message_thread_id=PAYOUT_TOPIC_ID or None
+                )
+            group_sent = True
+        except Exception:
+            logging.exception(
+                "Failed to publish payout application in group topic "
+                "(group_id=%s, topic_id=%s)",
+                PAYOUT_GROUP_ID, PAYOUT_TOPIC_ID
+            )
+
+    # Keep the admin's private notification and decision buttons.
     try:
         if len(photos) == 1:
-            await bot.send_photo(ADMIN_ID, photos[0], caption=caption,
-                                 reply_markup=decision_buttons(request_id))
+            await bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=photos[0],
+                caption=caption,
+                reply_markup=decision_buttons(request_id)
+            )
         else:
-            await bot.send_media_group(ADMIN_ID, [
-                InputMediaPhoto(media=photos[0]),
-                InputMediaPhoto(media=photos[1])
-            ])
-            await bot.send_message(ADMIN_ID, caption, reply_markup=decision_buttons(request_id))
-        await message.answer("✅ Заявка отправлена администратору.", reply_markup=menu())
+            await bot.send_media_group(
+                chat_id=ADMIN_ID,
+                media=[
+                    InputMediaPhoto(media=photos[0]),
+                    InputMediaPhoto(media=photos[1])
+                ]
+            )
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=caption,
+                reply_markup=decision_buttons(request_id)
+            )
+        admin_sent = True
     except Exception:
-        logging.exception("Failed to deliver payout application")
-        await message.answer("Заявка сохранена, но не удалось уведомить администратора. Попробуйте позже.")
+        logging.exception("Failed to deliver payout application to admin")
+
+    if group_sent or admin_sent:
+        await message.answer("✅ Заявка отправлена." + (
+            " Она опубликована в теме выплат." if group_sent else
+            " Администратор получил её в личные сообщения."
+        ), reply_markup=menu())
+    else:
+        await message.answer(
+            "Заявка сохранена, но не удалось отправить её в группу или администратору. "
+            "Проверьте права бота и настройки темы.",
+            reply_markup=menu()
+        )
     await state.clear()
 
 
